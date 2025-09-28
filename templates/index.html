@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="utf-8">
+  <title>Chamberlin+Associates Maintenance Map</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" defer></script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+  <script src="{{ url_for('static', filename='js/app.js') }}" defer></script>
+</head>
+<body class="h-full bg-slate-100 text-slate-900">
+  <div class="flex h-full flex-col">
+    <header class="relative z-[1200] border-b border-slate-200 bg-white shadow-sm">
+      <div class="mx-auto flex max-w-7xl flex-wrap items-center gap-3 px-4 py-4 sm:flex-nowrap sm:gap-4">
+        <h1 class="text-lg font-semibold text-slate-800">Chamberlin+Associates Maintenance Map</h1>
+        <div class="relative flex-1">
+          <input id="searchInput" type="search" placeholder="Search properties, locations, or staff..."
+                 class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200">
+          <span id="searchSpinner" class="pointer-events-none absolute right-3 top-1/2 hidden -translate-y-1/2 text-xs text-slate-400">Searching...</span>
+          <div id="searchResultsPanel" class="search-results-panel hidden"></div>
+        </div>
+        <div class="flex flex-wrap items-center gap-3">
+          <div class="relative">
+            <button id="regionFilterToggle" type="button"
+                    class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:border-indigo-400">
+              Regions
+              <span id="regionFilterCount" class="hidden rounded-full bg-indigo-600 px-2 py-0.5 text-xs font-semibold text-white"></span>
+            </button>
+            <div id="regionFilterPanel"
+                 class="hidden absolute right-0 z-30 mt-2 max-h-64 w-56 overflow-y-auto rounded-lg border border-slate-200 bg-white p-3 text-sm shadow-xl">
+            </div>
+          </div>
+          <div>
+            <label for="vacancySelect" class="block text-xs font-semibold uppercase text-slate-500">Vacancy</label>
+            <select id="vacancySelect"
+                    class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm focus:border-indigo-500 focus:outline-none">
+              <option value="all">All</option>
+              <option value="with">With vacancies</option>
+              <option value="without">Fully staffed</option>
+            </select>
+          </div>
+          <div class="flex items-end gap-2">
+            <div>
+              <label for="unitsMin" class="block text-xs font-semibold uppercase text-slate-500">Units (min)</label>
+              <input id="unitsMin" type="number" min="0"
+                     class="w-24 rounded-lg border border-slate-300 bg-white px-2 py-2 text-sm text-slate-700 shadow-sm focus:border-indigo-500 focus:outline-none">
+            </div>
+            <div>
+              <label for="unitsMax" class="block text-xs font-semibold uppercase text-slate-500">Units (max)</label>
+              <input id="unitsMax" type="number" min="0"
+                     class="w-24 rounded-lg border border-slate-300 bg-white px-2 py-2 text-sm text-slate-700 shadow-sm focus:border-indigo-500 focus:outline-none">
+            </div>
+            <button id="clearFiltersButton"
+                    class="mb-1 inline-flex items-center rounded-md border border-transparent bg-slate-200 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-300">
+              Clear
+            </button>
+          </div>
+        </div>
+      </div>
+    </header>
+    <main class="relative flex flex-1 overflow-hidden">
+      <aside class="sidebar flex w-80 flex-col bg-slate-950 text-white">
+        <div class="border-b border-slate-900/60 px-4 py-4">
+          <p class="text-sm text-slate-300">Properties</p>
+          <p id="propertyCount" class="mt-1 text-2xl font-semibold text-white">0</p>
+        </div>
+        <div id="sidebarContent" class="relative flex-1 overflow-y-auto">
+          <div id="propertyCards" class="space-y-3 p-4"></div>
+          <div id="emptyState" class="hidden px-4 py-6 text-sm text-slate-300">No properties match your filters.</div>
+        </div>
+      </aside>
+      <section class="relative flex flex-1">
+        <div id="map" class="absolute inset-0"></div>
+        <div id="legend" class="legend rounded-lg bg-white shadow-md">
+          <h3 class="text-sm font-semibold text-slate-700">Legend</h3>
+          <ul class="mt-2 space-y-1 text-xs text-slate-600">
+            <li class="flex items-center gap-2"><span class="legend-dot bg-emerald-500"></span>Fully staffed</li>
+            <li class="flex items-center gap-2"><span class="legend-dot bg-amber-400"></span>Vacancy</li>
+          </ul>
+        </div>
+        <button id="reloadButton"
+                class="reload-btn rounded-full bg-white px-4 py-2 text-sm font-medium text-slate-700 shadow-md">
+          Reload data
+        </button>
+        <div id="statusBanner"
+             class="status-banner hidden rounded-full bg-slate-900 px-4 py-2 text-xs font-semibold text-white shadow-lg">
+        </div>
+      </section>
+      <aside id="staffDrawer" class="drawer hidden">
+        <div class="drawer-header flex items-center justify-between border-b border-slate-200 px-4 py-3">
+          <div>
+            <p class="text-xs uppercase tracking-wide text-slate-500">Staff</p>
+            <h2 id="drawerTitle" class="text-lg font-semibold text-slate-900"></h2>
+          </div>
+          <button id="drawerClose"
+                  class="rounded-md border border-slate-200 px-2 py-1 text-sm text-slate-600 hover:bg-slate-100">Close</button>
+        </div>
+        <div id="drawerContent" class="drawer-content flex-1 overflow-y-auto p-4">
+          <p class="text-sm text-slate-500">Select a property to view staffing details.</p>
+        </div>
+      </aside>
+    </main>
+  </div>
+</body>
+</html>
