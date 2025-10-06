@@ -741,62 +741,89 @@ class DataStore:
     def _build_popup_html(self, record: Dict[str, Any]) -> str:
         property_id = record.get("propertyId") or ""
         property_name = record.get("property") or ""
+        
+        # Build address components like the sidebar card
+        city = record.get("city")
+        state = record.get("state")
+        location = "Location unavailable"
+        if city and state:
+            location = f"{city}, {state}"
+        elif city:
+            location = city
+        elif state:
+            location = state
+        
         address_parts = [
             record.get("address"),
-            ", ".join(filter(None, [record.get("city"), record.get("state")])),
+            ", ".join(filter(None, [city, state])),
             record.get("zip"),
         ]
-        formatted_address = ", ".join([part for part in address_parts if part])
-        google_query = formatted_address or property_name
-        maps_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(google_query)}"
-        website = record.get("website")
-        phone = record.get("phone")
+        full_address = ", ".join([part for part in address_parts if part]) or "Address n/a"
+        
+        # Build metadata like the sidebar card
         units = record.get("units")
-        vacancy_text = (
-            f"{record.get('vacantPositions')} open position(s)"
-            if record.get("hasVacancy")
-            else "Fully staffed"
+        units_text = f"{units} units" if units is not None else "Units n/a"
+        region_text = f"Region: {record.get('region')}" if record.get('region') else ""
+        
+        # Vacancy status and details
+        vacancy_class = (
+            "bg-amber-300/90 text-slate-900" if record.get("hasVacancy") 
+            else "bg-emerald-300/90 text-slate-900"
         )
-        website_markup = ""
-        if website:
-            website_markup = f'<a class="text-indigo-600 underline" href="{html.escape(website)}" target="_blank" rel="noopener">Website</a>'
-        phone_markup = ""
-        if phone:
-            phone_markup = f'<span class="block text-sm text-slate-600">Phone: {html.escape(phone)}</span>'
-        units_markup = ""
-        if units is not None:
-            units_markup = f'<span class="text-sm text-slate-600">{units} units</span>'
-        address_markup = ""
-        if formatted_address:
-            address_markup = (
-                f'<a class="text-sm text-slate-600 underline" target="_blank" rel="noopener" href="{maps_url}">'
-                f"{html.escape(formatted_address)}</a>"
-            )
-        button_markup = (
-            f'<button type="button" class="view-staff-btn mt-3 w-full rounded-md bg-slate-900 px-3 py-2 text-sm font-semibold text-white" '
-            f'data-property-id="{html.escape(property_id)}" data-property-name="{html.escape(property_name)}">'
-            "View staff</button>"
+        vacancy_label = "Vacancy" if record.get("hasVacancy") else "Fully staffed"
+        vacancy_details = (
+            f"{record.get('vacantPositions')} open" if record.get("hasVacancy")
+            else "All positions filled"
         )
-        website_line = (
-            f'<span class="block text-sm text-slate-600">{website_markup}</span>' if website_markup else ""
+        
+        # No location badge
+        no_location_badge = (
+            '' if record.get("hasCoordinates")
+            else '<span class="inline-block rounded bg-amber-200 px-2 py-1 text-xs font-medium text-amber-800 mt-2">No map location</span>'
         )
-        manager_line = self._staff_popup_line("Regional manager", record.get("regionalManager"))
-        maintenance_line = self._staff_popup_line("Regional maintenance", record.get("regionalMaintenanceSupervisor"))
-        staff_section = ""
-        staff_content = "".join(filter(None, [manager_line, maintenance_line]))
-        if staff_content:
-            staff_section = f'<div class="space-y-1 pt-1">{staff_content}</div>'
+        
+        # Format staff like sidebar card
+        def format_staff_text(staff):
+            if not staff:
+                return "Not assigned"
+            if staff.get("isVacant"):
+                return "Vacant"
+            return staff.get("employeeName") or "Not assigned"
+        
+        regional_manager = format_staff_text(record.get("regionalManager"))
+        regional_maintenance = format_staff_text(record.get("regionalMaintenanceSupervisor"))
+        
+        # Build metadata line
+        meta_parts = [units_text]
+        if region_text:
+            meta_parts.append(region_text)
+        meta_html = " • ".join(meta_parts)
+        
         return (
-            '<div class="space-y-2 min-w-[220px]">'
-            f'<h3 class="text-base font-semibold text-slate-900">{html.escape(property_name)}</h3>'
-            f'<span class="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium '
-            f'{"bg-amber-100 text-amber-900" if record.get("hasVacancy") else "bg-emerald-100 text-emerald-900"}">'
-            f'{html.escape("Vacancy" if record.get("hasVacancy") else "Fully staffed")}</span>'
-            f'<div class="text-sm text-slate-600 space-y-1">{address_markup}{phone_markup}{website_line}{units_markup}</div>'
-            f'{staff_section}'
-            f'<p class="text-sm text-slate-700">{html.escape(vacancy_text)}</p>'
-            f"{button_markup}"
-            "</div>"
+            f'<div class="bg-slate-900/60 rounded-lg border border-slate-800 p-4 shadow-md min-w-[280px]">'
+            f'<div class="flex items-start justify-between gap-3">'
+            f'<div class="min-w-0">'
+            f'<h3 class="truncate text-base font-semibold text-white">{html.escape(property_name)}</h3>'
+            f'<p class="text-xs text-slate-300">{html.escape(location)}</p>'
+            f'</div>'
+            f'<span class="status-chip {vacancy_class}">{html.escape(vacancy_label)}</span>'
+            f'</div>'
+            f'<div class="mt-3 space-y-2 text-xs text-slate-300">'
+            f'<p>{html.escape(full_address)}</p>'
+            f'<div class="text-[11px] uppercase tracking-wide text-slate-400">{html.escape(meta_html)}</div>'
+            f'<p>{html.escape(vacancy_details)}</p>'
+            f'{no_location_badge}'
+            f'</div>'
+            f'<div class="mt-3 space-y-1 text-xs text-slate-200">'
+            f'<p><span class="font-semibold text-slate-100">Regional Manager:</span> {html.escape(regional_manager)}</p>'
+            f'<p><span class="font-semibold text-slate-100">Regional Maintenance:</span> {html.escape(regional_maintenance)}</p>'
+            f'</div>'
+            f'<div class="mt-4">'
+            f'<button type="button" class="view-staff-btn w-full rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white hover:bg-indigo-700" '
+            f'data-property-id="{html.escape(property_id)}" data-property-name="{html.escape(property_name)}">'
+            f'View staff</button>'
+            f'</div>'
+            f'</div>'
         )
 
     def _build_search_corpus(
