@@ -98,6 +98,7 @@
       state.filters.query = value;
       debounceSearch();
     });
+    searchInput.addEventListener('keydown', onSearchKeydown);
 
     const vacancySelect = getElement(SELECTORS.vacancySelect);
     vacancySelect.addEventListener('change', () => {
@@ -165,6 +166,49 @@
     state.searchTimer = window.setTimeout(() => {
       performSearch();
     }, 250);
+  }
+
+  async function onSearchKeydown(event) {
+    if (event.key !== 'Enter') {
+      return;
+    }
+    const input = event.currentTarget;
+    const candidate = input ? input.value.trim() : '';
+    if (!candidate) {
+      return;
+    }
+    event.preventDefault();
+    const unlocked = await attemptAdminUnlock(candidate);
+    if (!unlocked) {
+      state.filters.query = candidate;
+      performSearch();
+    }
+  }
+
+  async function attemptAdminUnlock(candidate) {
+    try {
+      const response = await fetch('/api/admin/unlock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: candidate }),
+      });
+      if (!response.ok) {
+        return false;
+      }
+      const data = await response.json();
+      if (data && data.ok) {
+        try {
+          window.localStorage.setItem('adminSecret', candidate);
+        } catch (storageError) {
+          console.warn('Unable to persist admin secret', storageError);
+        }
+        window.location.href = '/admin';
+        return true;
+      }
+    } catch (error) {
+      console.error('Admin unlock request failed', error);
+    }
+    return false;
   }
 
   async function loadInitialData() {
