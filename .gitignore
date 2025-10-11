@@ -7,3 +7,5 @@ Properties_geocoded.xlsx
 Positions.xlsx
 config.yaml
 data/RMS allocations as of *.xlsx
+__tmp_*.py
+app_backup.py
