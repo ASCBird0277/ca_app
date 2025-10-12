@@ -119,6 +119,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 from urllib.parse import quote_plus
+try:
+    import requests  # used for auto-geocoding
+except Exception:  # pragma: no cover
+    requests = None
 
 
 
@@ -7948,7 +7952,6 @@ PROPERTY_FIELD_MAP = {
 
 
 
-    "positions": "Position(s)",
 
 
 
@@ -7956,7 +7959,6 @@ PROPERTY_FIELD_MAP = {
 
 
 
-    "pays": "Pay(s)",
 
 
 
@@ -8076,21 +8078,6 @@ PROPERTY_COLUMN_ORDER = [
 
 
 
-    "Position(s)",
-
-
-
-
-
-
-
-    "Pay(s)",
-
-
-
-
-
-
 
     "Latitude",
 
@@ -8125,157 +8112,19 @@ PROPERTY_COLUMN_ORDER = [
 
 
 EMPLOYEE_FIELD_MAP = {
-
-
-
-
-
-
-
     "employeeId": "EmployeeID",
-
-
-
-
-
-
-
-    "employeeName": "Employee Name",
-
-
-
-
-
-
-
     "firstName": "First Name",
-
-
-
-
-
-
-
     "lastName": "Last Name",
-
-
-
-
-
-
-
-    "title": "Title",
-
-
-
-
-
-
-
     "phone": "Phone",
-
-
-
-
-
-
-
     "email": "Email",
-
-
-
-
-
-
-
-    "property": "Property",
-
-
-
-
-
-
-
 }
 
-
-
-
-
-
-
 EMPLOYEE_COLUMN_ORDER = [
-
-
-
-
-
-
-
     "EmployeeID",
-
-
-
-
-
-
-
-    "Employee Name",
-
-
-
-
-
-
-
     "First Name",
-
-
-
-
-
-
-
     "Last Name",
-
-
-
-
-
-
-
-    "Title",
-
-
-
-
-
-
-
     "Phone",
-
-
-
-
-
-
-
     "Email",
-
-
-
-
-
-
-
-    "Property",
-
-
-
-
-
-
-
 ]
 
 
@@ -9099,19 +8948,300 @@ def _ensure_columns(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
     return df
 
 
+def _parse_positions_input(text: Optional[str]) -> List[str]:
+    """Parse a free-text positions field into a list of titles.
+    Splits on newlines, commas, and semicolons, trims blanks, de-duplicates while preserving order.
+    """
+    if not text:
+        return []
+    raw = str(text).replace("\r", "\n")
+    parts: List[str] = []
+    for chunk in raw.split("\n"):
+        for piece in chunk.split(","):
+            for leaf in piece.split(";"):
+                title = (leaf or "").strip()
+                if title:
+                    parts.append(title)
+    seen = set()
+    result: List[str] = []
+    for p in parts:
+        key = p.casefold()
+        if key not in seen:
+            seen.add(key)
+            result.append(p)
+    return result
 
 
+def _append_positions_for_property(property_id: str, property_name: Optional[str], titles: List[str]) -> int:
+    """Append one Positions row per title for the given property.
+    Only writes to columns that already exist in the Positions sheet to avoid creating new columns.
+    Returns the number of rows appended.
+    """
+    if not titles:
+        return 0
+    try:
+        sheets = pd.read_excel(POSITIONS_FILE_PATH, sheet_name=None, engine="openpyxl")
+    except FileNotFoundError as exc:
+        raise ValueError("Positions workbook is missing") from exc
+    positions_df = sheets.get("Positions")
+    if positions_df is None:
+        raise ValueError("Positions worksheet is missing")
+
+    # Determine allowed columns and simple PositionID generation if present
+    allowed_cols = list(positions_df.columns)
+    has_col = lambda c: c in allowed_cols
+
+    next_position_id: Optional[int] = None
+    id_prefix: Optional[str] = None
+    id_width: int = 0
+    if has_col("PositionID"):
+        # Extract numeric maximum and detect a common prefix/width
+        existing = positions_df.get("PositionID").dropna().astype(str).tolist()
+        max_num = 0
+        for val in existing:
+            s = str(val).strip()
+            digits = "".join(ch for ch in s if ch.isdigit())
+            if digits.isdigit():
+                try:
+                    n = int(digits)
+                    max_num = max(max_num, n)
+                    id_width = max(id_width, len(digits))
+                    if id_prefix is None and len(digits) < len(s):
+                        id_prefix = s.replace(digits, "")
+                except Exception:
+                    pass
+        next_position_id = max_num + 1
+        if id_prefix is None:
+            id_prefix = ""
+
+    new_rows: List[Dict[str, Any]] = []
+    for title in titles:
+        row: Dict[str, Any] = {}
+        if has_col("PropertyID"):
+            row["PropertyID"] = property_id
+        if has_col("Property"):
+            row["Property"] = property_name or None
+        if has_col("Position Title"):
+            row["Position Title"] = title
+        # Leave employee fields blank
+        for col in ("EmployeeID", "Employee First Name", "Employee Last Name"):
+            if has_col(col):
+                row[col] = ""
+        # Assign a PositionID if the column exists
+        if has_col("PositionID") and next_position_id is not None:
+            if id_width > 0:
+                row["PositionID"] = f"{id_prefix}{str(next_position_id).zfill(id_width)}"
+            else:
+                row["PositionID"] = f"{id_prefix}{next_position_id}"
+            next_position_id += 1
+        # Only include columns that already exist to avoid creating new ones
+        new_rows.append(row)
+
+    if not new_rows:
+        return 0
+
+    append_df = pd.DataFrame(new_rows)
+    # Ensure we do not add new columns by restricting to existing columns
+    append_df = append_df[[c for c in append_df.columns if c in allowed_cols]]
+    positions_df = pd.concat([positions_df, append_df], ignore_index=True)
+    sheets["Positions"] = positions_df
+    _write_workbook(POSITIONS_FILE_PATH, sheets)
+    return len(new_rows)
 
 
+def _place_employee_at_property(
+    to_property_id: Optional[str],
+    to_property_name: Optional[str],
+    position_title: str,
+    employee_id: Optional[str],
+    employee_name: Optional[str],
+    *,
+    confirm_replace: bool = True,
+    remove_from_source: bool = True,
+) -> Dict[str, Any]:
+    if not (to_property_id or to_property_name):
+        raise ValueError("Destination property is required")
+    if not position_title:
+        raise ValueError("Position title is required")
+    if not (employee_id or employee_name):
+        raise ValueError("Employee selection is required")
+
+    try:
+        sheets = pd.read_excel(POSITIONS_FILE_PATH, sheet_name=None, engine="openpyxl")
+    except FileNotFoundError as exc:
+        raise ValueError("Positions workbook is missing") from exc
+
+    positions_df = sheets.get("Positions")
+    if positions_df is None:
+        raise ValueError("Positions worksheet is missing")
+
+    def _canonical_series(series: pd.Series) -> pd.Series:
+        return series.fillna("").astype(str).map(datastore._canonical)
+
+    # Resolve destination candidates
+    dest_mask = pd.Series([False] * len(positions_df))
+    if to_property_id:
+        dest_mask = dest_mask | (_canonical_series(positions_df.get("PropertyID", pd.Series(["" ] * len(positions_df)))) == datastore._canonical(to_property_id))
+    if to_property_name:
+        dest_mask = dest_mask | (_canonical_series(positions_df.get("Property", pd.Series(["" ] * len(positions_df)))) == datastore._canonical(to_property_name))
+    candidates = positions_df[dest_mask]
+    if not candidates.empty and "Position Title" in candidates.columns:
+        title_mask = _canonical_series(candidates["Position Title"]) == datastore._canonical(position_title)
+        candidates = candidates[title_mask]
+
+    # If no candidate row exists for this position, create one and reload
+    if candidates.empty:
+        _append_positions_for_property(str(to_property_id or ""), to_property_name, [position_title])
+        try:
+            sheets = pd.read_excel(POSITIONS_FILE_PATH, sheet_name=None, engine="openpyxl")
+            positions_df = sheets.get("Positions")
+            dest_mask = pd.Series([False] * len(positions_df))
+            if to_property_id:
+                dest_mask = dest_mask | (_canonical_series(positions_df.get("PropertyID", pd.Series(["" ] * len(positions_df)))) == datastore._canonical(to_property_id))
+            if to_property_name:
+                dest_mask = dest_mask | (_canonical_series(positions_df.get("Property", pd.Series(["" ] * len(positions_df)))) == datastore._canonical(to_property_name))
+            candidates = positions_df[dest_mask]
+            if "Position Title" in candidates.columns:
+                title_mask = _canonical_series(candidates["Position Title"]) == datastore._canonical(position_title)
+                candidates = candidates[title_mask]
+        except Exception:
+            pass
+
+    if candidates.empty:
+        raise ValueError("No matching position found at destination property")
+
+    # Choose destination index
+    vacancy_mask = candidates.get("EmployeeID", pd.Series(["" ] * len(candidates))).fillna("").astype(str).str.strip() == ""
+    if vacancy_mask.any():
+        destination_index = candidates[vacancy_mask].index[0]
+    else:
+        if not confirm_replace:
+            return {"status": "needs-confirmation", "reason": "Position filled"}
+        destination_index = candidates.index[0]
+        # Clear occupant for this row
+        for column in ["EmployeeID", "Employee First Name", "Employee Last Name"]:
+            if column in positions_df.columns:
+                positions_df.at[destination_index, column] = ""
+
+    # Fill destination row
+    first_name = None
+    last_name = None
+    if employee_name and not employee_id:
+        parts = employee_name.split()
+        if parts:
+            first_name = parts[0]
+            if len(parts) > 1:
+                last_name = parts[-1]
+    if employee_id and "EmployeeID" in positions_df.columns:
+        positions_df.at[destination_index, "EmployeeID"] = employee_id
+    if "Employee First Name" in positions_df.columns:
+        positions_df.at[destination_index, "Employee First Name"] = first_name or ""
+    if "Employee Last Name" in positions_df.columns:
+        positions_df.at[destination_index, "Employee Last Name"] = last_name or ""
+    if to_property_name and "Property" in positions_df.columns:
+        positions_df.at[destination_index, "Property"] = to_property_name
+    if to_property_id and "PropertyID" in positions_df.columns:
+        positions_df.at[destination_index, "PropertyID"] = to_property_id
+    if position_title and "Position Title" in positions_df.columns:
+        positions_df.at[destination_index, "Position Title"] = position_title
+
+    # Optionally remove from other positions for this employee
+    if remove_from_source and employee_id and "EmployeeID" in positions_df.columns:
+        mask_other = (_canonical_series(positions_df["EmployeeID"]) == datastore._canonical(employee_id)) & (positions_df.index != destination_index)
+        for column in ["EmployeeID", "Employee First Name", "Employee Last Name"]:
+            if column in positions_df.columns:
+                positions_df.loc[mask_other, column] = ""
+
+    sheets["Positions"] = positions_df
+    _write_workbook(POSITIONS_FILE_PATH, sheets)
+
+    return {"destinationIndex": int(destination_index)}
 
 
+def _upsert_employee_core(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Create or update an employee without duplicating personal records.
 
+    Rules:
+    - Only personal info (ID, first, last, email, phone) is persisted in Employee.xlsx
+    - If EmployeeID provided, update that row
+    - Else, try to find an existing row by first/last and optional email/phone
+    - Else, reuse a blank row ID if available; otherwise allocate next ID
+    """
+    try:
+        df = _read_single_sheet(EMPLOYEE_FILE_PATH)
+    except FileNotFoundError:
+        df = pd.DataFrame(columns=EMPLOYEE_COLUMN_ORDER)
+    df = _ensure_columns(df, EMPLOYEE_COLUMN_ORDER)
+    df = _reorder_columns(df, EMPLOYEE_COLUMN_ORDER)
 
+    id_column = EMPLOYEE_FIELD_MAP["employeeId"]
+    blanks = _find_blank_rows(df, id_column, exclude={id_column})
 
+    employee_id = _normalize_text(payload.get("employeeId"))
+    first_name = _normalize_text(payload.get("firstName"))
+    last_name = _normalize_text(payload.get("lastName"))
+    email_val = _normalize_text(payload.get("email"))
+    phone_val = _normalize_text(payload.get("phone"))
 
+    row_index = None
+    if employee_id:
+        canonical = datastore._canonical(employee_id)
+        mask = df[id_column].fillna("").astype(str).map(datastore._canonical) == canonical
+        if mask.any():
+            row_index = df[mask].index[0]
+            employee_id = _clean_identifier(df.at[row_index, id_column]) or employee_id
+        else:
+            employee_id = None
 
+    # If no explicit ID match, deduplicate by name + optional contact info
+    if employee_id is None and (first_name or last_name):
+        try:
+            fn_col = EMPLOYEE_FIELD_MAP.get("firstName")
+            ln_col = EMPLOYEE_FIELD_MAP.get("lastName")
+            em_col = EMPLOYEE_FIELD_MAP.get("email")
+            ph_col = EMPLOYEE_FIELD_MAP.get("phone")
 
+            def _norm_series(series):
+                return series.fillna("").astype(str).map(lambda v: (_normalize_text(v) or "").casefold())
 
+            mask = pd.Series([True] * len(df))
+            if first_name:
+                mask = mask & (_norm_series(df[fn_col]) == (first_name or "").casefold())
+            if last_name:
+                mask = mask & (_norm_series(df[ln_col]) == (last_name or "").casefold())
+            if email_val:
+                mask = mask & (_norm_series(df[em_col]) == (email_val or "").casefold())
+            if phone_val:
+                mask = mask & (_norm_series(df[ph_col]) == (phone_val or "").casefold())
+            if mask.any():
+                row_index = df[mask].index[0]
+                employee_id = _clean_identifier(df.at[row_index, id_column]) or None
+        except Exception:
+            pass
+
+    if employee_id is None:
+        if blanks:
+            row_index, employee_id = blanks[0]
+        else:
+            employee_id = _allocate_employee_id(df[id_column])
+
+    payload = {**payload, "employeeId": employee_id}
+    row_data = _employee_payload_to_row(payload)
+
+    if row_index is not None and isinstance(row_index, int):
+        for column, value in row_data.items():
+            df.at[row_index, column] = value
+    else:
+        df = pd.concat([df, pd.DataFrame([row_data])], ignore_index=True)
+
+    _write_single_sheet(EMPLOYEE_FILE_PATH, df)
+
+    return {
+        "employeeId": employee_id,
+        "firstName": first_name,
+        "lastName": last_name,
+        "employeeName": (" ".join([first_name or "", last_name or ""]).strip() or None),
+    }
 def _property_payload_to_row(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
@@ -9312,150 +9442,25 @@ def _employee_payload_to_row(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+
 def _load_employees() -> List[Dict[str, Any]]:
-
-
-
-
-
-
-
     df = _read_single_sheet(EMPLOYEE_FILE_PATH)
-
-
-
-
-
-
-
     df = _ensure_columns(df, EMPLOYEE_COLUMN_ORDER)
-
-
-
-
-
-
-
     df = _reorder_columns(df, EMPLOYEE_COLUMN_ORDER)
 
-
-
-
-
-
-
     records: List[Dict[str, Any]] = []
-
-
-
-
-
-
-
     for item in df.fillna("").to_dict(orient="records"):
-
-
-
-
-
-
-
-        records.append(
-
-
-
-
-
-
-
-            {
-
-
-
-
-
-
-
-                "employeeId": item.get("EmployeeID", ""),
-
-
-
-
-
-
-
-                "employeeName": item.get("Employee Name", ""),
-
-
-
-
-
-
-
-                "firstName": item.get("First Name", ""),
-
-
-
-
-
-
-
-                "lastName": item.get("Last Name", ""),
-
-
-
-
-
-
-
-                "title": item.get("Title", ""),
-
-
-
-
-
-
-
-                "phone": item.get("Phone", ""),
-
-
-
-
-
-
-
-                "email": item.get("Email", ""),
-
-
-
-
-
-
-
-                "property": item.get("Property", ""),
-
-
-
-
-
-
-
-            }
-
-
-
-
-
-
-
-        )
-
-
-
-
-
-
-
+        first = _normalize_text(item.get("First Name")) or ""
+        last = _normalize_text(item.get("Last Name")) or ""
+        fullname = item.get("Employee Name") or (" ".join([first, last]).strip())
+        records.append({
+            "employeeId": item.get("EmployeeID", ""),
+            "employeeName": fullname,
+            "firstName": first,
+            "lastName": last,
+            "email": item.get("Email", ""),
+            "phone": item.get("Phone", ""),
+        })
     return records
 
 
@@ -10238,6 +10243,40 @@ def admin_upsert_property():
 
         canonical_id = datastore._canonical(str(property_id))
 
+        # Ensure PropertyID uniqueness: if duplicates exist, consolidate to a single row
+        try:
+            dupe_mask = df[id_column].fillna("").astype(str).map(datastore._canonical) == canonical_id
+            if dupe_mask.any():
+                dupe_indices = list(df[dupe_mask].index)
+                # Prefer a non-blank row if present; otherwise the first duplicate
+                def _row_is_blank(idx: int) -> bool:
+                    row = df.loc[idx]
+                    for col in df.columns:
+                        if col == id_column:
+                            continue
+                        val = row.get(col)
+                        if isinstance(val, float):
+                            try:
+                                import math
+                                if math.isnan(val):
+                                    continue
+                            except Exception:
+                                pass
+                        if str(val).strip():
+                            return False
+                    return True
+
+                nonblank = [i for i in dupe_indices if not _row_is_blank(i)]
+                if row_index is None:
+                    row_index = (nonblank[0] if nonblank else dupe_indices[0])
+                keep_index = row_index
+                extras = [i for i in dupe_indices if i != keep_index]
+                if extras:
+                    df = df.drop(index=extras).reset_index(drop=True)
+        except Exception:
+            # Do not fail the transaction for cleanup issues; continue with write
+            pass
+
 
 
 
@@ -10285,13 +10324,13 @@ def admin_upsert_property():
 
 
         if row_index is not None and isinstance(row_index, int):
-
-
-
-
-
-
-
+            
+            
+            
+            
+            
+            
+            
             for column, value in row_data.items():
 
 
@@ -10309,13 +10348,13 @@ def admin_upsert_property():
 
 
         else:
-
-
-
-
-
-
-
+            
+            
+            
+            
+            
+            
+            
             df = pd.concat([df, pd.DataFrame([row_data])], ignore_index=True)
 
 
@@ -10333,6 +10372,49 @@ def admin_upsert_property():
 
 
         _write_single_sheet(PROPERTY_FILE_PATH, df)
+
+        # Create initial positions for this property if provided in payload
+        try:
+            positions_text = _normalize_text(payload.get("positions"))
+            titles = _parse_positions_input(positions_text)
+            if titles:
+                _append_positions_for_property(str(property_id), property_name, titles)
+        except Exception as exc:
+            logger.exception("Failed to append positions for property %s: %s", property_id, exc)
+
+        # Optional: handle positionAssignments for immediate placement (transfer or hire)
+        try:
+            assignments = payload.get("positionAssignments") or []
+            for entry in assignments:
+                try:
+                    position_title = _normalize_text(entry.get("position") or entry.get("positionTitle"))
+                    if not position_title:
+                        continue
+                    action = (_normalize_text(entry.get("action")) or "transfer").casefold()
+                    keep_existing = bool(entry.get("keepExisting"))
+                    remove_from_source = not keep_existing
+                    if action == "transfer":
+                        emp_id = _normalize_text(entry.get("employeeId"))
+                        emp_name = _normalize_text(entry.get("employeeName"))
+                        _place_employee_at_property(str(property_id), property_name, position_title, emp_id, emp_name, confirm_replace=True, remove_from_source=remove_from_source)
+                    elif action == "hire":
+                        emp_payload = {
+                            "employeeId": _normalize_text(entry.get("employeeId")),
+                            "firstName": _normalize_text(entry.get("firstName")),
+                            "lastName": _normalize_text(entry.get("lastName")),
+                            "title": _normalize_text(entry.get("title")) or position_title,
+                            "phone": _normalize_text(entry.get("phone")),
+                            "email": _normalize_text(entry.get("email")),
+                            "property": property_name,
+                        }
+                        created = _upsert_employee_core(emp_payload)
+                        emp_id = created.get("employeeId")
+                        emp_name = created.get("employeeName")
+                        _place_employee_at_property(str(property_id), property_name, position_title, emp_id, emp_name, confirm_replace=True, remove_from_source=False)
+                except Exception as inner:
+                    logger.exception("Assignment failed for property %s: %s", property_id, inner)
+        except Exception as exc:
+            logger.exception("Assignments processing failed for property %s: %s", property_id, exc)
 
 
 
@@ -10389,6 +10471,26 @@ def admin_upsert_property():
 
 
     return jsonify({"ok": True, "property": updated_property, "propertyId": property_id})
+
+@app.route("/api/admin/geocode", methods=["POST"])
+def admin_geocode():
+    guard = _require_admin()
+    if guard:
+        return guard
+    payload = request.get_json(silent=True) or {}
+    address = _normalize_text(payload.get("address"))
+    city = _normalize_text(payload.get("city"))
+    state = _normalize_text(payload.get("state"))
+    zip_code = _normalize_text(payload.get("zip"))
+    bits = [address, city, state, zip_code, "USA"]
+    query = ", ".join([x for x in bits if x])
+    if not query:
+        return jsonify({"ok": False, "error": "Address, city/state or zip required"}), 400
+    email = _config_value(["geocode_email"]) or _config_value(["flags", "geocode_email"]) or _config_value(["email"]) or None
+    lat, lon, status = _nominatim_geocode(query, email)
+    if lat is None or lon is None:
+        return jsonify({"ok": False, "error": f"Geocode failed: {status}"}), 502
+    return jsonify({"ok": True, "latitude": lat, "longitude": lon, "status": status})
 
 
 
@@ -11916,7 +12018,7 @@ def admin_create_transfer():
 
 
 
-    if result.get("status") == "needs-confirmation":
+    if result.get("status") in {"needs-confirmation", "needs-selection"}:
 
 
 
@@ -12453,6 +12555,61 @@ def _allocate_employee_id(series: pd.Series) -> str:
 
 
     return f"E{highest + 1:03d}" if highest else "E001"
+
+
+# --- Auto Geocoding helpers ---
+def _config_value(path: List[str], default: Optional[str] = None) -> Optional[str]:
+    try:
+        with open("config.yaml", "r", encoding="utf-8") as _f:
+            cfg = yaml.safe_load(_f) or {}
+        cur: Any = cfg
+        for key in path:
+            cur = (cur or {}).get(key)
+            if cur is None:
+                return default
+        return cur if isinstance(cur, str) else default
+    except Exception:
+        return default
+
+
+def _nominatim_geocode(query: str, email: Optional[str]) -> Tuple[Optional[float], Optional[float], str]:
+    if not requests or not query:
+        return None, None, "unavailable"
+    try:
+        params = {"q": query, "format": "json", "limit": 1, "addressdetails": 0}
+        if email:
+            params["email"] = email
+        headers = {"User-Agent": "ca-admin/1.0 (+geocode)"}
+        resp = requests.get("https://nominatim.openstreetmap.org/search", params=params, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            return None, None, f"http-{resp.status_code}"
+        data = resp.json()
+        if not data:
+            return None, None, "noresult"
+        lat = float(data[0].get("lat")) if data[0].get("lat") is not None else None
+        lon = float(data[0].get("lon")) if data[0].get("lon") is not None else None
+        if lat is None or lon is None:
+            return None, None, "noresult"
+        return lat, lon, "ok"
+    except Exception:
+        return None, None, "error"
+
+
+def _maybe_autogeocode(row: Dict[str, Any]) -> None:
+    """Fill Latitude/Longitude if missing using Nominatim and configured email."""
+    lat = row.get("Latitude")
+    lon = row.get("Longitude")
+    if (lat not in (None, "")) and (lon not in (None, "")):
+        return
+    address_bits = [row.get("Address") or "", row.get("City") or "", row.get("State") or "", str(row.get("ZIP") or ""), "USA"]
+    q = ", ".join([str(x).strip() for x in address_bits if str(x).strip()])
+    if not q:
+        return
+    email = _config_value(["geocode_email"]) or _config_value(["flags", "geocode_email"]) or _config_value(["email"]) or None
+    glat, glon, status = _nominatim_geocode(q, email)
+    if glat is not None and glon is not None:
+        row["Latitude"] = glat
+        row["Longitude"] = glon
 
 
 
@@ -13414,6 +13571,11 @@ def _remove_property_records(property_id: Optional[str], property_name: Optional
 
 
                 if sheet_mask.any():
+                    # Drop matching rows instead of clearing columns to avoid stale positions
+                    sheet_df = sheet_df.loc[~sheet_mask].copy()
+                    sheets[sheet_name] = sheet_df
+                    positions_updated = True
+                    continue
 
 
 
@@ -13538,6 +13700,87 @@ def _remove_property_records(property_id: Optional[str], property_name: Optional
 
 
     return int(mask.sum()), positions_updated
+
+@app.route("/api/admin/cleanup", methods=["POST"])
+def admin_cleanup():
+    """One-click data cleanup: de-dupe properties by ID and harden Employees sheet."""
+    guard = _require_admin()
+    if guard:
+        return guard
+
+    results: Dict[str, Any] = {"ok": True}
+
+    # Properties: enforce unique PropertyID
+    try:
+        dfp = _read_single_sheet(PROPERTY_FILE_PATH)
+        dfp = _ensure_columns(dfp, PROPERTY_COLUMN_ORDER)
+        dfp = _reorder_columns(dfp, PROPERTY_COLUMN_ORDER)
+        pid_col = PROPERTY_FIELD_MAP["propertyId"]
+
+        def _blank_prop_row(idx: int) -> bool:
+            row = dfp.loc[idx]
+            for col in dfp.columns:
+                if col == pid_col:
+                    continue
+                val = row.get(col)
+                if str(val).strip():
+                    return False
+            return True
+
+        removed = 0
+        seen: Dict[str, int] = {}
+        drop_indices: List[int] = []
+        for idx, val in dfp[pid_col].fillna("").astype(str).items():
+            key = datastore._canonical(val)
+            if not key:
+                continue
+            if key not in seen:
+                seen[key] = idx
+                continue
+            keep_idx = seen[key]
+            # Prefer non-blank row as keeper
+            if _blank_prop_row(keep_idx) and not _blank_prop_row(idx):
+                drop_indices.append(keep_idx)
+                seen[key] = idx
+            else:
+                drop_indices.append(idx)
+        if drop_indices:
+            removed = len(drop_indices)
+            dfp = dfp.drop(index=drop_indices).reset_index(drop=True)
+            _write_single_sheet(PROPERTY_FILE_PATH, dfp)
+        results["properties_removed"] = removed
+    except Exception as exc:
+        results["ok"] = False
+        results["properties_error"] = str(exc)
+
+    # Employees: restrict columns and collapse duplicate IDs
+    try:
+        dfe = _read_single_sheet(EMPLOYEE_FILE_PATH)
+        dfe = _ensure_columns(dfe, EMPLOYEE_COLUMN_ORDER)
+        dfe = _reorder_columns(dfe, EMPLOYEE_COLUMN_ORDER)
+        # Drop any extra columns if present
+        dfe = dfe[[c for c in EMPLOYEE_COLUMN_ORDER if c in dfe.columns]]
+        id_col = EMPLOYEE_FIELD_MAP["employeeId"]
+        drop_e: List[int] = []
+        seen_e: set[str] = set()
+        for idx, val in dfe[id_col].fillna("").astype(str).items():
+            key = datastore._canonical(val)
+            if not key:
+                continue
+            if key in seen_e:
+                drop_e.append(idx)
+            else:
+                seen_e.add(key)
+        if drop_e:
+            dfe = dfe.drop(index=drop_e).reset_index(drop=True)
+        _write_single_sheet(EMPLOYEE_FILE_PATH, dfe)
+        results["employees_removed"] = len(drop_e)
+    except Exception as exc:
+        results["ok"] = False
+        results["employees_error"] = str(exc)
+
+    datastore.reload()
+    return jsonify(results)
 
 
 
@@ -14549,7 +14792,20 @@ def _perform_transfer(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
-        source_index = positions_df[employee_mask].index[0]
+        matched_indexes = positions_df[employee_mask].index.tolist()
+        if len(matched_indexes) > 1 and not payload.get("removeFromSourceIndexes"):
+            options: List[Dict[str, Any]] = []
+            for idx in matched_indexes:
+                row = positions_df.loc[idx]
+                options.append({
+                    "index": int(idx),
+                    "propertyId": _clean_identifier(row.get("PropertyID")),
+                    "propertyName": _normalize_text(row.get("Property")),
+                    "position": _normalize_text(row.get("Position Title")),
+                })
+            return {"status": "needs-selection", "positions": options}
+
+        source_index = matched_indexes[0]
 
 
 
@@ -15093,7 +15349,9 @@ def _perform_transfer(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
-            if column in positions_df.columns:
+            # Gate clearing of source by removeFromSource flag
+            remove_from_source = bool(payload.get("removeFromSource", True))
+            if remove_from_source and column in positions_df.columns:
 
 
 
@@ -15102,6 +15360,22 @@ def _perform_transfer(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
                 positions_df.at[source_index, column] = ""
+
+        # Optionally clear additional prior positions selected by the client
+        remove_from_source = bool(payload.get("removeFromSource", True))
+        if remove_from_source:
+            extra_indexes = payload.get("removeFromSourceIndexes") or []
+            try:
+                indices = [int(i) for i in extra_indexes]
+            except Exception:
+                indices = []
+            for idx in indices:
+                if idx == source_index:
+                    continue
+                if 0 <= idx < len(positions_df):
+                    for column in ["EmployeeID", "Employee First Name", "Employee Last Name"]:
+                        if column in positions_df.columns:
+                            positions_df.at[idx, column] = ""
 
 
 
@@ -15970,6 +16244,12 @@ if __name__ == "__main__":
 
 
         app.run(debug=True)
+
+
+
+
+
+
 
 
 
