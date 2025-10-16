@@ -1,0 +1,133 @@
+(() => {
+  'use strict';
+
+  const S = { secret:'', props:[], e:[], pById:new Map(), pByName:new Map(), eById:new Map(), eByName:new Map(), transferConfirm:null };
+  const H = (id)=>document.getElementById(id);
+  const EH = (h)=>String(h||'').replace(/[&<>"']/g,(c)=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]||c));
+  const A = (m,t='info',ms=3000)=>{const w=document.createElement('div');w.innerHTML=`<div class="alert alert-${t} alert-dismissible fade show" role="alert">${EH(m)}<button type="button" class="btn-close" data-bs-dismiss="alert"></button></div>`;H('alertPlaceholder').append(w); if(ms>0) setTimeout(()=>bootstrap.Alert.getOrCreateInstance(w.firstElementChild).close(),ms)};
+  const canon=(v)=>String(v||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+  const rd=(id)=>{const el=H(id); if(!el) return null; const v=el.value; return v==null?null:String(v).trim()||null};
+  const auth=async(p,o={})=>{ if(!S.secret) throw new Error('Missing admin secret'); const h=new Headers(o.headers||{}); h.set('X-Admin-Secret',S.secret); const m=(o.method||'GET').toUpperCase(); if(m!=='GET'&&o.body&&!h.has('Content-Type')) h.set('Content-Type','application/json'); let url=p; url+=(url.includes('?')?'&':'?')+`admin_secret=${encodeURIComponent(S.secret)}`; return fetch(url,{...o,headers:h}); };
+  const err=async(r)=>{ try{ const d=await r.json(); throw new Error(d.error||d.message||`Status ${r.status}`);} catch{ throw new Error(`Status ${r.status}`);} };
+
+  document.addEventListener('DOMContentLoaded', init);
+
+  async function init(){
+    bindHeader();
+    if(!(await unlock())){ A('Admin secret required.','danger',6000); return; }
+    await Promise.all([loadProps(), loadEmps()]);
+    showHome();
+  }
+
+  function bindHeader(){
+    const map = {
+      adminLock: ()=>{ localStorage.removeItem('adminSecret'); S.secret=''; A('Locked. Reload to continue.','info'); },
+      backToHome: showHome,
+      openProperty: ()=>{ const m=document.querySelector('input[name="homePropertyMode"]:checked').value; (m==='add'?renderPropAdd:renderPropRemove)(); },
+      openEmployee: ()=>{ const m=document.querySelector('input[name="homeEmployeeMode"]:checked').value; (m==='add'?renderEmpAdd:renderEmpRemove)(); },
+      openTransfer: renderTransfer,
+      openPropertyEdit: renderPropEdit,
+      openEmployeeEdit: renderEmpEdit,
+      adminCleanup: runCleanup,
+      adminGeocodeMissing: runGeocodeMissing,
+      adminReloadData: async ()=>{ try{ const r=await auth('/api/reload',{method:'POST'}); if(r.ok){ A('Reload requested.','success'); await loadProps(); } else { await err(r); } } catch(e){ A('Reload failed: '+e.message,'danger',5000);} },
+    };
+    Object.entries(map).forEach(([id,fn])=>{ const el=H(id); if(el) el.onclick = fn; });
+  }
+
+  async function unlock(){
+    for(let i=0;i<3;i++){
+      let s=(localStorage.getItem('adminSecret')||'').trim();
+      if(!s){ s=(prompt('Enter the admin secret')||'').trim(); if(!s) return false; localStorage.setItem('adminSecret', s); }
+      S.secret=s;
+      try{ const r=await auth('/api/admin/ping'); if(r.ok){ const d=await r.json(); if(d&&d.ok) return true; } }catch{}
+      localStorage.removeItem('adminSecret'); A('Secret rejected, try again.','danger');
+    }
+    return false;
+  }
+
+  function showHome(){ H('panel-home').classList.add('active'); H('workArea').innerHTML=''; H('backToHome').classList.add('d-none'); }
+  function showWork(html){ H('panel-home').classList.remove('active'); H('workArea').innerHTML=html; H('backToHome').classList.remove('d-none'); }
+
+  async function loadProps(){ try{ const r=await auth('/api/admin/properties'); if(!r.ok) return; const d=await r.json(); const ps=Array.isArray(d.properties)?d.properties:[]; S.props=ps; S.pById=new Map(); S.pByName=new Map(); ps.forEach(p=>{ const id=(p.propertyId||'').trim(); const nm=(p.property||'').trim(); if(id) S.pById.set(canon(id),p); if(nm) S.pByName.set(canon(nm),p); }); }catch{} }
+  async function loadEmps(){ try{ const r=await auth('/api/admin/employees'); if(!r.ok) return; const d=await r.json(); const es=Array.isArray(d.employees)?d.employees:[]; S.e=es; S.eById=new Map(); S.eByName=new Map(); es.forEach(e=>{ const id=(e.employeeId||'').trim(); const nm=(e.employeeName||'').trim(); if(id) S.eById.set(canon(id),e); if(nm) S.eByName.set(canon(nm),e); }); }catch{} }
+
+  async function runGeocodeMissing(){
+    const btn = H('adminGeocodeMissing');
+    if(btn) { btn.disabled = true; btn.textContent = 'Geocoding...'; }
+    try{
+      await loadProps();
+      const props = (S.props||[]).filter(p=>!p.hasCoordinates);
+      if(!props.length){ A('No properties need geocoding.','info'); return; }
+      let updated=0, skipped=0, failed=0;
+      const failures=[];
+      for(const p of props){
+        const address = (p.address||'').trim();
+        const city = (p.city||'').trim();
+        const state = (p.state||'').trim();
+        const zip = (p.zip||'').trim();
+        if(!(address||city||state||zip)) { skipped++; failures.push({p, reason:'no_address'}); continue; }
+        // Try a few fallback query styles
+        const attempts = [
+          { address, city, state, zip },
+          { address:'', city, state, zip },
+          { address: `${p.property||''}`, city, state, zip },
+        ];
+        let result=null;
+        for(const body of attempts){
+          try{
+            const r = await auth('/api/admin/geocode',{method:'POST', body: JSON.stringify(body)});
+            if(!r.ok){ /* try next style */ continue; }
+            const d = await r.json();
+            if(d && d.ok && typeof d.latitude==='number' && typeof d.longitude==='number'){
+              result = d; break;
+            }
+          }catch{ /* continue */ }
+        }
+        if(!result){ failed++; failures.push({p, reason:'noresult'}); continue; }
+        try{
+          const save = await auth('/api/admin/properties',{
+            method:'POST',
+            body: JSON.stringify({ propertyId: p.propertyId, property: p.property, latitude: result.latitude, longitude: result.longitude })
+          });
+          if(!save.ok){ await err(save); }
+          updated++;
+          p.latitude = result.latitude; p.longitude = result.longitude; p.hasCoordinates = true;
+        }catch(e){ failed++; failures.push({p, reason:'save_failed'}); }
+        // Be polite to the geocoder
+        await new Promise(res=>setTimeout(res, 1100));
+      }
+      const detail = failures.slice(0,5).map(f=>`• ${f.p.property||'(name n/a)'} — ${f.reason}`).join('\n');
+      const msg = `Geocoding complete: ${updated} updated, ${skipped} skipped, ${failed} failed.` + (failures.length? `\n${detail}${failures.length>5?'\n…':''}`:'');
+      A(msg, failed? 'warning':'success', 8000);
+      if(window.console){ console.info('Geocode failures', failures); }
+    } finally {
+      if(btn){ btn.disabled=false; btn.textContent='Geocode Missing'; }
+    }
+  }
+
+  // Property Add with staffing
+  function renderPropAdd(){
+    showWork(`<section class="panel active"><div class="text-uppercase small text-muted mb-2">Add Property</div><form id="propAdd" class="row g-3"><div class="col-md-8"><label class="form-label">Name</label><input id="pName" class="form-control" required></div><div class="col-md-4"><label class="form-label">Units</label><input id="pUnits" type="number" min="0" class="form-control"></div><div class="col-md-12"><label class="form-label">Address</label><input id="pAddr" class="form-control"></div><div class="col-md-4"><label class="form-label">City</label><input id="pCity" class="form-control"></div><div class="col-md-2"><label class="form-label">State</label><input id="pState" class="form-control"></div><div class="col-md-2"><label class="form-label">Zip</label><input id="pZip" class="form-control"></div><div class="col-md-2"><label class="form-label">Lat</label><input id="pLat" type="number" step="any" class="form-control"></div><div class="col-md-2"><label class="form-label">Lon</label><input id="pLon" type="number" step="any" class="form-control"></div><div class="col-12"><div class="d-flex align-items-center justify-content-between"><label class="form-label mb-0">Assignments (optional)</label><div class="btn-group"><button type="button" id="toggleStaffing" class="btn btn-sm btn-outline-primary">Staff this property</button><button type="button" id="addAssignmentRow" class="btn btn-sm btn-outline-secondary">Add Assignment</button></div></div><div id="propertyAssignments" class="mt-2 d-none"></div></div><div class="col-12 d-grid gap-2"><div class="d-flex gap-2"><button id="savePropertyOnly" class="btn btn-primary flex-fill" type="submit">Create without staffing</button><button id="saveAndStaff" class="btn btn-success flex-fill" type="submit">Save &amp; Staff</button></div></div></form></section>`);
+    H('toggleStaffing').onclick=()=>H('propertyAssignments').classList.toggle('d-none');
+    H('addAssignmentRow').onclick=()=>addAssignmentRow(H('propertyAssignments'));
+    H('propAdd').addEventListener('submit', handlePropertySubmit);
+  }
+  async function handlePropertySubmit(e){ e.preventDefault(); const wantStaff=(e.submitter&&e.submitter.id==='saveAndStaff'); const payload=collectPropertyPayload(); if(!payload.property){ A('Property name is required','warning'); return; } try{ const r=await auth('/api/admin/properties',{method:'POST',body:JSON.stringify(payload)}); if(!r.ok) await err(r); A('Property saved.','success'); if(!wantStaff) showHome(); }catch(ex){ A(ex.message||'Unable to save property.','danger'); } }
+  function addAssignmentRow(container){ const idx = container.querySelectorAll('.assignment-row').length + 1; const wrap=document.createElement('div'); wrap.className='assignment-row border rounded p-2 mb-2'; wrap.innerHTML = `<div class="row g-2 align-items-end"><div class="col-md-4"><label class="form-label">Position Title</label><input class="form-control assign-position" placeholder="e.g., Maintenance Supervisor"></div><div class="col-md-2"><label class="form-label">Action</label><select class="form-select assign-action"><option value="transfer">Transfer</option><option value="hire">Hire</option></select></div><div class="col-md-5 assign-transfer-fields"><label class="form-label">Employee (ID or Name)</label><input class="form-control assign-employee" placeholder="E123 or Jane Doe"><div class="form-check mt-1"><input class="form-check-input assign-keep" type="checkbox" id="assignKeep${idx}"><label class="form-check-label" for="assignKeep${idx}">Keep existing positions</label></div></div><div class="col-md-5 assign-hire-fields d-none"><div class="row g-2"><div class="col-6"><label class="form-label">First</label><input class="form-control assign-first"></div><div class="col-6"><label class="form-label">Last</label><input class="form-control assign-last"></div><div class="col-6"><label class="form-label">Title</label><input class="form-control assign-title" placeholder="Defaults to position title"></div><div class="col-6"><label class="form-label">Email</label><input type="email" class="form-control assign-email"></div><div class="col-6"><label class="form-label">Phone</label><input class="form-control assign-phone"></div></div></div><div class="col-md-1 d-grid"><button type="button" class="btn btn-outline-danger btn-sm">Remove</button></div></div>`; container.appendChild(wrap); const sel=wrap.querySelector('.assign-action'); const tr=wrap.querySelector('.assign-transfer-fields'); const hr=wrap.querySelector('.assign-hire-fields'); sel.addEventListener('change',()=>{ const hire=sel.value==='hire'; hr.classList.toggle('d-none',!hire); tr.classList.toggle('d-none',hire); }); wrap.querySelector('button.btn-outline-danger').addEventListener('click',()=>wrap.remove()); }
+  function collectPropertyPayload(){ const payload={ property: rd('pName'), units:Number(rd('pUnits')||'')||null, address:rd('pAddr'), city:rd('pCity'), state:rd('pState'), zip:rd('pZip'), latitude:Number(rd('pLat')||'')||null, longitude:Number(rd('pLon')||'')||null, positions:null }; const rows=document.querySelectorAll('#propertyAssignments .assignment-row'); if(rows.length){ const assignments=[]; rows.forEach(row=>{ const position=row.querySelector('.assign-position')?.value?.trim()||''; const action=row.querySelector('.assign-action')?.value||'transfer'; if(!position) return; if(action==='transfer'){ const ref=row.querySelector('.assign-employee')?.value?.trim()||''; const keep=row.querySelector('.assign-keep')?.checked||false; assignments.push({ position, action, employeeId: ref && /\b[EA]\d+/i.test(ref) ? ref : null, employeeName: ref && !/\b[EA]\d+/i.test(ref) ? ref : null, keepExisting: keep }); } else { assignments.push({ position, action, firstName: row.querySelector('.assign-first')?.value?.trim()||null, lastName: row.querySelector('.assign-last')?.value?.trim()||null, title: row.querySelector('.assign-title')?.value?.trim()||null, email: row.querySelector('.assign-email')?.value?.trim()||null, phone: row.querySelector('.assign-phone')?.value?.trim()||null }); } }); if(assignments.length) payload.positionAssignments=assignments; } return payload; }
+
+  // Property remove/edit
+  function renderPropRemove(){ const opts=S.props.filter(p=>p.property).sort((a,b)=>(a.property||'').localeCompare(b.property||'')).map(p=>`<option value="${EH(p.property)}">`).join(''); showWork(`<section class="panel active"><div class="text-uppercase small text-muted mb-2">Remove Property</div><form id="propDel" class="row g-3"><div class="col-12"><label class="form-label">Property Name</label><input id="pDelName" class="form-control" list="pDelOpts" required></div><div class="col-12 d-grid"><button class="btn btn-danger" type="submit">Remove Property</button></div><datalist id="pDelOpts">${opts}</datalist></form></section>`); H('propDel').addEventListener('submit', async (e)=>{ e.preventDefault(); const name=rd('pDelName'); if(!name){ A('Provide a property name','warning'); return; } if(!confirm(`Clear property "${name}"?`)) return; try{ const r=await auth(`/api/admin/properties?Name=${encodeURIComponent(name)}`,{method:'DELETE'}); if(!r.ok) await err(r); await loadProps(); A('Property cleared.','success'); showHome(); }catch(ex){ A(ex.message||'Unable to clear property.','danger'); } }); }
+  function renderPropEdit(){ const opts=S.props.slice().sort((a,b)=>(a.property||'').localeCompare(b.property||'')) .map(p=>`<option value="${EH(p.propertyId||p.property||'')}">${EH(p.property||'Unnamed')} ${p.propertyId?`(${EH(p.propertyId)})`:''}</option>`).join(''); showWork(`<section class="panel active"><div class="text-uppercase small text-muted mb-2">Edit Property</div><div class="mb-3"><label class="form-label">Select Property</label><select id="pEditSelect" class="form-select"><option value="">Select...</option>${opts}</select></div><div id="pEditWrap"></div></section>`); H('pEditSelect').addEventListener('change',()=>{ const ref=H('pEditSelect').value; if(!ref){ H('pEditWrap').innerHTML=''; return; } const rec=(()=>{ const c=canon(ref); return S.pById.get(c)||S.pByName.get(c)||null; })(); if(!rec){ A('Unable to locate property','danger'); return; } H('pEditWrap').innerHTML = `<form id=\"propEdit\" class=\"row g-3\"><div class=\"col-md-8\"><label class=\"form-label\">Name</label><input id=\"pName\" class=\"form-control\" value=\"${EH(rec.property||'')}\"></div><div class=\"col-md-4\"><label class=\"form-label\">Units</label><input id=\"pUnits\" type=\"number\" class=\"form-control\" value=\"${EH(rec.units||'')}\"></div><div class=\"col-md-12\"><label class=\"form-label\">Address</label><input id=\"pAddr\" class=\"form-control\" value=\"${EH(rec.address||'')}\"></div><div class=\"col-md-4\"><label class=\"form-label\">City</label><input id=\"pCity\" class=\"form-control\" value=\"${EH(rec.city||'')}\"></div><div class=\"col-md-2\"><label class=\"form-label\">State</label><input id=\"pState\" class=\"form-control\" value=\"${EH(rec.state||'')}\"></div><div class=\"col-md-2\"><label class=\"form-label\">Zip</label><input id=\"pZip\" class=\"form-control\" value=\"${EH(rec.zip||'')}\"></div><div class=\"col-md-2\"><label class=\"form-label\">Lat</label><input id=\"pLat\" type=\"number\" step=\"any\" class=\"form-control\" value=\"${EH(rec.latitude??'')}\"></div><div class=\"col-md-2\"><label class=\"form-label\">Lon</label><input id=\"pLon\" type=\"number\" step=\"any\" class=\"form-control\" value=\"${EH(rec.longitude??'')}\"></div><div class=\"col-12 d-grid\"><button class=\"btn btn-primary\" type=\"submit\">Update Property</button></div></form>`; H('propEdit').addEventListener('submit', async (e)=>{ e.preventDefault(); const payload={ property:rd('pName'), units:Number(rd('pUnits')||'')||null, address:rd('pAddr'), city:rd('pCity'), state:rd('pState'), zip:rd('pZip'), latitude:Number(rd('pLat')||'')||null, longitude:Number(rd('pLon')||'')||null, propertyId: rec.propertyId }; if(!payload.property){ A('Property name is required','warning'); return; } try{ const r=await auth('/api/admin/properties',{method:'POST',body:JSON.stringify(payload)}); if(!r.ok) await err(r); await loadProps(); A('Property updated.','success'); showHome(); }catch(ex){ A(ex.message||'Unable to update property.','danger'); } }); }); }
+
+  // Employee add/remove/edit
+  function renderEmpAdd(){ showWork(`<section class=\"panel active\"><div class=\"text-uppercase small text-muted mb-2\">Add Employee</div><form id=\"empAdd\" class=\"row g-3\"><div class=\"col-md-4\"><label class=\"form-label\">First</label><input id=\"eFirst\" class=\"form-control\"></div><div class=\"col-md-4\"><label class=\"form-label\">Last</label><input id=\"eLast\" class=\"form-control\"></div><div class=\"col-md-4\"><label class=\"form-label\">Title</label><input id=\"eTitle\" class=\"form-control\"></div><div class=\"col-md-6\"><label class=\"form-label\">Property</label><input id=\"eProp\" class=\"form-control\" placeholder=\"Optional\"></div><div class=\"col-md-3\"><label class=\"form-label\">Email</label><input id=\"eEmail\" type=\"email\" class=\"form-control\"></div><div class=\"col-md-3\"><label class=\"form-label\">Phone</label><input id=\"ePhone\" class=\"form-control\"></div><div class=\"col-12 d-grid\"><button class=\"btn btn-primary\" type=\"submit\">Save Employee</button></div></form></section>`); H('empAdd').addEventListener('submit', async (e)=>{ e.preventDefault(); const payload={ firstName:rd('eFirst'), lastName:rd('eLast'), title:rd('eTitle'), property:rd('eProp'), email:rd('eEmail'), phone:rd('ePhone') }; try{ const r=await auth('/api/admin/employees',{method:'POST',body:JSON.stringify(payload)}); if(!r.ok) await err(r); await loadEmps(); A('Employee saved.','success'); showHome(); }catch(ex){ A(ex.message||'Unable to save employee.','danger'); } }); }
+  function renderEmpRemove(){ const idOpts=S.e.filter(x=>x.employeeId).sort((a,b)=>(a.employeeId||'').localeCompare(b.employeeId||'')).map(x=>`<option value=\"${EH(x.employeeId)}\">${EH(x.employeeName||'')}`).join(''); showWork(`<section class=\"panel active\"><div class=\"text-uppercase small text-muted mb-2\">Remove Employee</div><form id=\"empDel\" class=\"row g-3\"><div class=\"col-md-6\"><label class=\"form-label\">Employee ID</label><input id=\"delId\" class=\"form-control\" list=\"idOpts\" required></div><div class=\"col-md-6\"><label class=\"form-label\">Termination Date</label><input id=\"delDate\" type=\"date\" class=\"form-control\"></div><div class=\"col-12 d-grid\"><button class=\"btn btn-danger\" type=\"submit\">Remove Employee</button></div><datalist id=\"idOpts\">${idOpts}</datalist></form></section>`); H('empDel').addEventListener('submit', async (e)=>{ e.preventDefault(); const id=rd('delId'); if(!id){ A('Employee ID required','warning'); return; } if(!confirm(`Remove employee ${id}?`)) return; const date=rd('delDate'); try{ let url=`/api/admin/employees?EmployeeID=${encodeURIComponent(id)}`; if(date) url+=`&terminatedOn=${encodeURIComponent(date)}`; const r=await auth(url,{method:'DELETE'}); if(!r.ok) await err(r); await loadEmps(); A('Employee removed.','success'); showHome(); }catch(ex){ A(ex.message||'Unable to remove employee.','danger'); } }); }
+  function renderEmpEdit(){ const opts=S.e.slice().sort((a,b)=>(a.employeeName||'').localeCompare(b.employeeName||'')) .map(e=>`<option value="${EH(e.employeeId||e.employeeName||'')}">${EH(e.employeeName||'Unnamed')} ${e.employeeId?`(${EH(e.employeeId)})`:''}</option>`).join(''); showWork(`<section class="panel active"><div class="text-uppercase small text-muted mb-2">Edit Employee</div><div class="mb-3"><label class="form-label">Select Employee</label><select id="eSel" class="form-select"><option value="">Select...</option>${opts}</select></div><div id="eWrap"></div></section>`); H('eSel').addEventListener('change',()=>{ const ref=H('eSel').value; if(!ref){ H('eWrap').innerHTML=''; return;} const rec=S.eById.get(canon(ref))||S.eByName.get(canon(ref)); if(!rec){ A('Unable to locate employee','danger'); return;} H('eWrap').innerHTML = `<form id="eEdit" class="row g-3"><div class="col-md-4"><label class="form-label">First</label><input id="eFirst" class="form-control" value="${EH(rec.firstName||'')}"></div><div class="col-md-4"><label class="form-label">Last</label><input id="eLast" class="form-control" value="${EH(rec.lastName||'')}"></div><div class="col-md-3"><label class="form-label">Email</label><input id="eEmail" type="email" class="form-control" value="${EH(rec.email||'')}"></div><div class="col-md-3"><label class="form-label">Phone</label><input id="ePhone" class="form-control" value="${EH(rec.phone||'')}"></div><div class="col-12 d-grid"><button class="btn btn-primary" type="submit">Update</button></div></form>`; H('eEdit').addEventListener('submit', async (e)=>{ e.preventDefault(); const payload={ employeeId: rec.employeeId, firstName: rd('eFirst'), lastName: rd('eLast'), email: rd('eEmail'), phone: rd('ePhone') }; try{ const r=await auth('/api/admin/employees',{method:'POST',body:JSON.stringify(payload)}); if(!r.ok) await err(r); await loadEmps(); A('Employee updated.','success'); showHome(); }catch(ex){ A(ex.message||'Unable to update.','danger'); } }); }); }
+
+  // Transfer minimal
+  function renderTransfer(){ showWork(`<section class=\"panel active\"><div class=\"text-uppercase small text-muted mb-2\">Transfer Employee</div><form id=\"xfer\" class=\"row g-3\"><div class=\"col-md-4\"><label class=\"form-label\">Employee ID</label><input id=\"tId\" class=\"form-control\" placeholder=\"E001\"></div><div class=\"col-md-4\"><label class=\"form-label\">To Property</label><input id=\"tProp\" class=\"form-control\" placeholder=\"Name or ID\"></div><div class=\"col-md-4\"><label class=\"form-label\">New Position</label><input id=\"tPos\" class=\"form-control\"></div><div class=\"col-md-6\"><label class=\"form-label\">Effective Date</label><input id=\"tDate\" type=\"date\" class=\"form-control\"></div><div class=\"col-md-6\"><label class=\"form-label\">Notes</label><input id=\"tNotes\" class=\"form-control\"></div><div class=\"col-12 form-check ms-2\"><input id=\"tKeep\" class=\"form-check-input\" type=\"checkbox\"><label class=\"form-check-label\" for=\"tKeep\">Keep employee in old positions</label></div><div class=\"col-12 d-grid\"><button class=\"btn btn-primary\" type=\"submit\">Submit Transfer</button></div></form></section>`); H('xfer').addEventListener('submit', async (e)=>{ e.preventDefault(); const id=rd('tId'), prop=rd('tProp'), pos=rd('tPos'); if(!id||!prop||!pos){ A('Employee, property and position required','warning'); return; } const keep=H('tKeep').checked; const payload={ employeeId:id, toProperty:prop, position:pos, effectiveDate:rd('tDate'), notes:rd('tNotes'), removeFromSource:!keep, confirmReplace:false }; try{ let r=await auth('/api/admin/transfers',{method:'POST',body:JSON.stringify(payload)}); if(r.status===409){ const d=await r.json(); if(d&&d.occupant){ payload.confirmReplace=true; r=await auth('/api/admin/transfers',{method:'POST',body:JSON.stringify(payload)}) } } if(!r.ok) await err(r); A('Transfer completed.','success'); showHome(); }catch(ex){ A(ex.message||'Transfer failed','danger'); } }); }
+
+  async function runCleanup(){ try{ const r=await auth('/api/admin/cleanup',{method:'POST'}); const d=await r.json(); if(!r.ok || !d.ok){ A((d&&d.properties_error)||(d&&d.employees_error)||'Cleanup failed','danger'); return; } A(`Cleanup OK. Properties removed: ${d.properties_removed||0}; Employees removed: ${d.employees_removed||0}`,'success',5000); await Promise.all([loadProps(),loadEmps()]); }catch(ex){ A(ex.message||'Cleanup failed','danger'); } }
+})();
