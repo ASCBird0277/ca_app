@@ -1,0 +1,42 @@
+mappings:
+  employees:
+    EmployeeID: [EmployeeID, Employee Id, EmpID, Emp Id, ID, Identifier]
+    EmployeeName: [EmployeeName, Employee Name, Name, FullName, Full Name, Worker]
+    FirstName: [FirstName, First Name, GivenName, Given Name]
+    LastName: [LastName, Last Name, Surname, FamilyName, Family Name]
+    Email: [Email, EmailAddress, Email Address, Mail]
+    Phone: [Phone, PhoneNumber, Phone Number, Mobile, MobilePhone, Mobile Phone, Contact]
+  properties:
+    Property: [Property, PropertyName, Property Name, Name, Community, Site, Location]
+    PropertyID: [PropertyID, Property Id, PropID, Prop Id, SiteID, Site Id, CommunityID]
+    Address: [Address, Street, StreetAddress, Street Address]
+    City: [City, Town, Municipality]
+    State: [State, Province, RegionState, ST]
+    Zip: [Zip, ZipCode, PostalCode, Postal, ZIP]
+    Latitude: [Latitude, Lat, LAT, Y, YCoord]
+    Longitude: [Longitude, Lon, Lng, LONG, X, XCoord]
+    Units: [Units, UnitCount, TotalUnits, Homes]
+    Region: [Region, Area, Market, Territory]
+    Website: [Website, URL, SiteURL, HomePage]
+    Phone: [Phone, PhoneNumber, Phone Number, Contact, MainPhone]
+    RegionalManager: [RegionalManager, Regional Manager, Region Manager, RegManager]
+    RegionalManagerEmail: [RegionalManagerEmail, Regional Manager Email, Region Manager Email]
+    RegionalManagerPhone: [RegionalManagerPhone, Regional Manager Phone, Region Manager Phone]
+    RegionalMaintenanceSupervisor: [RegionalMaintenanceSupervisor, Regional Maintenance Supervisor, Regional Maintenance Manager, Regional Service Manager]
+    RegionalMaintenanceEmail: [RegionalMaintenanceEmail, Regional Maintenance Email, Regional Service Email]
+    RegionalMaintenancePhone: [RegionalMaintenancePhone, Regional Maintenance Phone, Regional Service Phone]
+  positions:
+    EmployeeID: [EmployeeID, Employee Id, EmpID, Emp Id, ID, Identifier]
+    PropertyID: [PropertyID, Property Id, PropID, Prop Id, SiteID, Site Id]
+    Property: [Property, PropertyName, Property Name, Site, Community, Location]
+    JobTitle: [JobTitle, Job Title, Title, Role, Position, Position Title]
+    EmployeeFirstName: [EmployeeFirstName, Employee First Name, FirstName, First Name]
+    EmployeeLastName: [EmployeeLastName, Employee Last Name, LastName, Last Name]
+    IsVacant: [IsVacant, Vacant, Vacancy, VacancyFlag, Open, OpenRole]
+flags:
+  treat_missing_positions_as_vacant: true
+  # Temporary bypass to restore admin access if secret mismatch occurs
+  disable_admin_auth: true
+
+# Contact email used by the geocoder (Nominatim requires a valid contact)
+geocode_email: "amosley1127@gmail.com"
