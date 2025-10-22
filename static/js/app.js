@@ -894,26 +894,52 @@
   function renderDrawerContent(data) {
     const content = getElement(SELECTORS.drawerContent);
     const employees = data.employees || [];
-    const roleOrder = [
-      'property manager',
-      'maintenance supervisor',
-      'assistant manager',
-      'leasing agent',
-      'assistant leasing agent',
-      'maintenance tech',
-      'make ready tech',
-      'rover',
-      'painter',
-      'hvac',
-      'porter',
-      'housekeeper',
-    ];
+    // Priority order requested by stakeholders
     const priorityFor = (title) => {
-      const t = String(title || '').toLowerCase();
-      for (let i = 0; i < roleOrder.length; i += 1) {
-        if (t.includes(roleOrder[i])) return i;
-      }
-      return roleOrder.length + 1;
+      const t = String(title || '').toLowerCase().trim();
+      const has = (s) => t.includes(s);
+      const any = (...arr) => arr.some((k) => has(k));
+      const none = (...arr) => !any(...arr);
+
+      // 0: Property/Community Manager (exclude regional/assistant)
+      if ((any('property manager', 'community manager') || (has('manager') && any('property', 'community')))
+          && none('assistant', 'regional')) return 0;
+
+      // 1: Assistant Manager (assistant + manager)
+      if (has('assistant') && has('manager')) return 1;
+
+      // 2: Leasing Agent (non-assistant)
+      if (any('leasing agent', 'leasing consultant', 'leasing professional', 'leasing specialist')
+          && none('assistant')) return 2;
+
+      // 3: Assistant Leasing (any kind)
+      if (has('leasing') && has('assistant')) return 3;
+
+      // 4: Maintenance (generic; not supervisor/manager/lead/tech/admin)
+      if (has('maintenance') && none('supervisor', 'manager', 'lead', 'tech', 'technician', 'admin', 'administrator', 'coordinator', 'regional')) return 4;
+
+      // 5: Maintenance Admin (admin/administrator/coordinator)
+      if (has('maintenance') && any('admin', 'administrator', 'coordinator')) return 5;
+
+      // 6: Supervisor (Maintenance Supervisor or Service Manager)
+      if (has('supervisor') || (has('service') && has('manager'))) return 6;
+
+      // 7: Maintenance Lead
+      if ((has('maintenance') && has('lead')) || (has('service') && has('lead'))) return 7;
+
+      // 8: Maintenance Tech
+      if (has('maintenance') && any('tech', 'technician')) return 8;
+
+      // 9: Other tech variants
+      if (any('make ready', 'make-ready', 'turn tech', 'turns', 'turn', 'rover', 'painter', 'hvac', 'grounds', 'groundskeeper', 'appliance', 'pool', 'punch')) return 9;
+
+      // 10: Porter
+      if (has('porter')) return 10;
+
+      // 11: Housekeeper
+      if (any('housekeeper', 'housekeeping')) return 11;
+
+      return 12; // any other
     };
     employees.sort((a, b) => {
       const pa = priorityFor(a.jobTitle);
@@ -931,8 +957,12 @@
     const q = String(state.filters.query || '').trim().toLowerCase();
     employees.forEach((employee) => {
       const card = document.createElement('div');
-      const name = employee.employeeName || 'Vacant position';
       const jobTitle = employee.jobTitle || 'Role n/a';
+      const t = String(jobTitle).toLowerCase();
+      const isKeyRole = t.includes('property manager') || t.includes('community manager') || t.includes('maintenance supervisor') || (t.includes('service') && t.includes('manager'));
+      const baseName = (employee.employeeName || '').trim();
+      const isUnassigned = (!employee.isVacant) && isKeyRole && !baseName;
+      const name = isUnassigned ? 'Unassigned' : (baseName || (employee.isVacant ? 'Vacant position' : 'Unassigned'));
       const alsoWorksAt = Array.isArray(employee.otherProperties) && employee.otherProperties.length
         ? `Also works at: ${employee.otherProperties.join(', ')}`
         : '';
