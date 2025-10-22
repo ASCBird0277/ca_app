@@ -3242,11 +3242,16 @@ class DataStore:
 
             units = self._coerce_int(row.get("Units"))
 
-
-
-
-
-
+            # Attempt auto-geocoding if coordinates are missing and address data is present
+            try:
+                if (row.get("Latitude") in (None, "")) and (row.get("Longitude") in (None, "")):
+                    if (row.get("Address") or row.get("City") or row.get("State") or row.get("Zip") or row.get("ZIP")):
+                        # Normalize ZIP key expected by helper
+                        if ("ZIP" not in row) and ("Zip" in row):
+                            row["ZIP"] = row.get("Zip")
+                        _maybe_autogeocode(row)
+            except Exception:
+                pass
 
             latitude = self._coerce_float(row.get("Latitude"))
 
@@ -3872,15 +3877,22 @@ class DataStore:
 
 
 
-            if treat_missing_vacant and not employee_id:
-
-
-
-
-
-
-
-                is_vacant = True
+            if treat_missing_vacant:
+                _fallback_first = self._clean_nullable(row.get("EmployeeFirstName"))
+                _fallback_last = self._clean_nullable(row.get("EmployeeLastName"))
+                _fallback_name = ' '.join(part for part in [_fallback_first, _fallback_last] if part) or None
+                no_identifier = not bool((employee_id or "").strip())
+                no_name = not bool((_fallback_name or "").strip())
+                if no_identifier and no_name:
+                    # Treat missing assignment as vacant for most roles,
+                    # but keep key roles (Property Manager/Maintenance Supervisor) as unassigned unless explicitly vacant
+                    job_title = self._clean_nullable(row.get("JobTitle")) or self._clean_nullable(row.get("Position Title"))
+                    jt = (job_title or "").casefold()
+                    is_key_role = (
+                        ("manager" in jt and "property" in jt and "regional" not in jt and "assistant" not in jt)
+                        or ((("maintenance" in jt and ("supervisor" in jt or "manager" in jt)) or ("service" in jt and "manager" in jt)) and ("regional" not in jt))
+                    )
+                    is_vacant = False if is_key_role else True
 
 
 
@@ -4048,6 +4060,11 @@ class DataStore:
 
 
 
+            # Determine unassigned flag (no vacancy, no id, no name)
+            _eid = (employee_id or "").strip()
+            _ename = (str(employee_name) if employee_name is not None else "").strip()
+            is_unassigned = (not is_vacant_flag) and (not _eid) and (not _ename)
+
             position_record = {
 
 
@@ -4113,6 +4130,7 @@ class DataStore:
 
 
                 "isVacant": is_vacant_flag,
+                "isUnassigned": is_unassigned,
 
 
 
@@ -4378,6 +4396,44 @@ class DataStore:
 
             record["tooltip"] = self._build_tooltip(record)
 
+            # Mark properties with unassigned key roles (Property Manager / Maintenance Supervisor)
+            try:
+                def _title(txt: Optional[str]) -> str:
+                    return (txt or "").casefold().strip()
+
+                def _is_unassigned(pos: Dict[str, Any]) -> bool:
+                    # Not explicitly vacant and missing concrete assignment
+                    if bool(pos.get("isVacant")):
+                        return False
+                    has_id = (pos.get("employeeId") or "").strip() != ""
+                    has_name = (pos.get("employeeName") or "").strip() != ""
+                    return not (has_id or has_name)
+
+                unassigned_pm = False
+                unassigned_ms = False
+                for pos in positions:
+                    t = _title(pos.get("jobTitle"))
+                    if not t:
+                        continue
+                    # Property Manager (exclude regional/assistant)
+                    if (
+                        "manager" in t and "property" in t and "regional" not in t and "assistant" not in t
+                    ):
+                        if _is_unassigned(pos):
+                            unassigned_pm = True
+                    # Maintenance Supervisor / Service Manager (exclude regional)
+                    if (
+                        ("maintenance" in t and ("supervisor" in t or "manager" in t))
+                        or ("service" in t and "manager" in t)
+                    ) and ("regional" not in t):
+                        if _is_unassigned(pos):
+                            unassigned_ms = True
+
+                record["hasUnassignedKeyRoles"] = bool(unassigned_pm or unassigned_ms)
+            except Exception:
+                # Fail-safe: do not block rendering if classification fails
+                record["hasUnassignedKeyRoles"] = False
+
 
 
 
@@ -4385,6 +4441,67 @@ class DataStore:
 
 
             record["popupHtml"] = self._build_popup_html(record)
+
+            # Post-process: detect "no information" case for key roles and adjust marker/labels
+            try:
+                def _title(txt: Optional[str]) -> str:
+                    return (txt or "").casefold().strip()
+
+                def _is_unassigned(pos: Dict[str, Any]) -> bool:
+                    # Not explicitly vacant and missing concrete assignment
+                    if bool(pos.get("isVacant")):
+                        return False
+                    has_id = (pos.get("employeeId") or "").strip() != ""
+                    has_name = (pos.get("employeeName") or "").strip() != ""
+                    return not (has_id or has_name)
+
+                seen_pm = False
+                seen_ms = False
+                any_unassigned_pm = False
+                any_unassigned_ms = False
+
+                for pos in positions:
+                    t = _title(pos.get("jobTitle"))
+                    if not t:
+                        continue
+                    # Property Manager (exclude regional/assistant)
+                    if ("manager" in t and "property" in t and "regional" not in t and "assistant" not in t):
+                        seen_pm = True
+                        if _is_unassigned(pos):
+                            any_unassigned_pm = True
+                    # Maintenance Supervisor / Service Manager (exclude regional)
+                    if (("maintenance" in t and ("supervisor" in t or "manager" in t)) or ("service" in t and "manager" in t)) and ("regional" not in t):
+                        seen_ms = True
+                        if _is_unassigned(pos):
+                            any_unassigned_ms = True
+
+                unassigned_pm = (not seen_pm) or any_unassigned_pm
+                unassigned_ms = (not seen_ms) or any_unassigned_ms
+
+                record["hasUnassignedKeyRoles"] = bool(unassigned_pm or unassigned_ms)
+
+                # If BOTH PM and MS are unassigned (no info), treat property as "no info":
+                # - Force non-vacancy for marker coloring, regardless of other vacancies
+                if unassigned_pm and unassigned_ms:
+                    record["hasNoInfo"] = True
+                    record["hasVacancy"] = False
+                    record["markerColor"] = "green"
+                    record["vacancyLabel"] = "Fully staffed"
+                else:
+                    record["hasNoInfo"] = False
+            except Exception:
+                # Fail-safe: do not block rendering if classification fails
+                record["hasUnassignedKeyRoles"] = record.get("hasUnassignedKeyRoles", False)
+                record["hasNoInfo"] = record.get("hasNoInfo", False)
+
+            # Rebuild tooltip/popup to reflect any overrides
+            record["tooltip"] = self._build_tooltip(record)
+            record["popupHtml"] = self._build_popup_html(record)
+            if record.get("hasNoInfo") and isinstance(record.get("tooltip"), str):
+                try:
+                    record["tooltip"] = record["tooltip"].replace("Fully staffed", "Info missing")
+                except Exception:
+                    pass
 
 
 
@@ -6129,29 +6246,8 @@ class DataStore:
 
 
         vacancy_class = (
-
-
-
-
-
-
-
-            "bg-amber-300/90 text-slate-900" if record.get("hasVacancy")
-
-
-
-
-
-
-
-            else "bg-emerald-300/90 text-slate-900"
-
-
-
-
-
-
-
+            "bg-sky-300/90 text-slate-900" if record.get("hasNoInfo")
+            else ("bg-amber-300/90 text-slate-900" if record.get("hasVacancy") else "bg-emerald-300/90 text-slate-900")
         )
 
 
@@ -6160,7 +6256,10 @@ class DataStore:
 
 
 
-        vacancy_label = "Vacancy" if record.get("hasVacancy") else "Fully staffed"
+        vacancy_label = (
+            "Info missing" if record.get("hasNoInfo")
+            else ("Vacancy" if record.get("hasVacancy") else "Fully staffed")
+        )
 
 
 
@@ -6169,29 +6268,8 @@ class DataStore:
 
 
         vacancy_details = (
-
-
-
-
-
-
-
-            f"{record.get('vacantPositions')} open" if record.get("hasVacancy")
-
-
-
-
-
-
-
-            else "All positions filled"
-
-
-
-
-
-
-
+            "Key roles unknown" if record.get("hasNoInfo")
+            else (f"{record.get('vacantPositions')} open" if record.get("hasVacancy") else "All positions filled")
         )
 
 
@@ -6273,14 +6351,16 @@ class DataStore:
 
 
             if staff.get("isVacant"):
-
-
-
-
-
-
-
+                
+                
+                
+                
+                
+                
+                
                 return "Vacant"
+            if staff.get("isUnassigned"):
+                return "Unassigned"
 
 
 
@@ -10843,6 +10923,102 @@ def admin_list_employees():
 
 
     return jsonify({"ok": True, "employees": _load_employees()})
+
+
+@app.route("/api/admin/reconcile-employee-ids", methods=["POST"])
+def admin_reconcile_employee_ids():
+    guard = _require_admin()
+    if guard:
+        return guard
+
+    try:
+        sheets = pd.read_excel(POSITIONS_FILE_PATH, sheet_name=None, engine="openpyxl")
+    except FileNotFoundError:
+        return jsonify({"ok": False, "error": "Positions workbook is missing"}), 400
+
+    positions_df = sheets.get("Positions")
+    if positions_df is None:
+        return jsonify({"ok": False, "error": "Positions worksheet is missing"}), 400
+
+    employees = _load_employees()
+
+    def canon(v: Optional[str]) -> str:
+        return datastore._canonical(v)
+
+    by_id: Dict[str, Dict[str, Any]] = {}
+    by_name_multi: Dict[str, List[Dict[str, Any]]] = {}
+    for e in employees:
+        e_id = canon(e.get("employeeId"))
+        if e_id:
+            by_id[e_id] = e
+        key = canon(f"{e.get('firstName') or ''} {e.get('lastName') or ''}")
+        if key:
+            by_name_multi.setdefault(key, []).append(e)
+
+    by_name_unique: Dict[str, Dict[str, Any]] = {k: v[0] for k, v in by_name_multi.items() if len(v) == 1}
+
+    for col in ("EmployeeID", "Employee First Name", "Employee Last Name"):
+        if col not in positions_df.columns:
+            positions_df[col] = ""
+
+    updates: List[Dict[str, Any]] = []
+    conflicts: List[Dict[str, Any]] = []
+    examined = 0
+    for idx, row in positions_df.iterrows():
+        examined += 1
+        eid = str(row.get("EmployeeID") or "").strip()
+        first = str(row.get("Employee First Name") or "").strip()
+        last = str(row.get("Employee Last Name") or "").strip()
+        name_key = canon(f"{first} {last}")
+
+        if eid and canon(eid) in by_id:
+            if name_key and name_key in by_name_unique:
+                target = by_name_unique[name_key]
+                if canon(target.get("employeeId")) != canon(eid):
+                    positions_df.at[idx, "EmployeeID"] = target.get("employeeId") or ""
+                    if not first:
+                        positions_df.at[idx, "Employee First Name"] = target.get("firstName") or ""
+                    if not last:
+                        positions_df.at[idx, "Employee Last Name"] = target.get("lastName") or ""
+                    updates.append({
+                        "row": int(idx),
+                        "position": str(row.get("Position Title") or ""),
+                        "property": str(row.get("Property") or ""),
+                        "employeeId": target.get("employeeId") or "",
+                    })
+            continue
+
+        target: Optional[Dict[str, Any]] = by_name_unique.get(name_key)
+        if target:
+            positions_df.at[idx, "EmployeeID"] = target.get("employeeId") or ""
+            if not first:
+                positions_df.at[idx, "Employee First Name"] = target.get("firstName") or ""
+            if not last:
+                positions_df.at[idx, "Employee Last Name"] = target.get("lastName") or ""
+            updates.append({
+                "row": int(idx),
+                "position": str(row.get("Position Title") or ""),
+                "property": str(row.get("Property") or ""),
+                "employeeId": target.get("employeeId") or "",
+            })
+        elif name_key:
+            conflicts.append({
+                "row": int(idx),
+                "position": str(row.get("Position Title") or ""),
+                "property": str(row.get("Property") or ""),
+                "first": first,
+                "last": last,
+                "candidates": [e.get("employeeId") for e in by_name_multi.get(name_key, [])],
+            })
+
+    if updates:
+        sheets["Positions"] = positions_df
+        try:
+            _write_workbook(POSITIONS_FILE_PATH, sheets)
+        except PermissionError as exc:
+            return handle_permission_error(exc)
+
+    return jsonify({"ok": True, "examined": examined, "updated": len(updates), "conflicts": conflicts[:50]})
 
 
 
