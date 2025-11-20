@@ -24,6 +24,7 @@
       handler: null,
     },
     isSearching: false,
+    isMobile: false,
   };
 
   const SELECTORS = {
@@ -49,15 +50,22 @@
     drawerTitle: 'drawerTitle',
     drawerContent: 'drawerContent',
     drawerClose: 'drawerClose',
+    mobileOverlay: 'mobileOverlay',
+    mobileCardStack: 'mobileCardStack',
+    mobileSearchBtn: 'mobileSearchBtn',
+    mobileAdvancedBtn: 'mobileAdvancedBtn',
   };
 
   const VIRTUAL_THRESHOLD = 120;
   const CARD_HEIGHT = 148;
+  let advPanelOriginalParent = null;
 
   document.addEventListener('DOMContentLoaded', () => {
+    detectMobile();
     initializeMap();
     bindUI();
     loadInitialData();
+    window.addEventListener('resize', detectMobile);
   });
 
   function initializeMap() {
@@ -118,6 +126,24 @@
         }, { once: true });
       }
     });
+  }
+
+  function detectMobile() {
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+    const mobile = viewportWidth <= 768;
+    state.isMobile = mobile;
+    document.body.classList.toggle('is-mobile', mobile);
+    const overlay = document.getElementById(SELECTORS.mobileOverlay);
+    if (overlay) {
+      overlay.classList.toggle('hidden', !mobile);
+      if (mobile) {
+        overlay.classList.remove('hidden');
+      }
+    }
+    moveAdvancedPanelForMobile(mobile);
+    if (!mobile) {
+      document.body.classList.remove('show-header');
+    }
   }
 
   function fitMapToVisibleProperties() {
@@ -228,6 +254,28 @@
       }
     });
 
+    // Mobile CTA buttons hook into existing search + advanced filters
+    wireMobileSearch();
+    const mobileAdvancedBtn = document.getElementById(SELECTORS.mobileAdvancedBtn);
+    if (mobileAdvancedBtn && advPanel) {
+      mobileAdvancedBtn.addEventListener('click', () => {
+        if (state.isMobile) {
+          advPanel.classList.toggle('hidden');
+        } else if (advToggle) {
+          advToggle.click();
+          advPanel?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      });
+    }
+    document.addEventListener('click', (event) => {
+      if (!state.isMobile) return;
+      const advPanelEl = document.getElementById(SELECTORS.advancedFilters);
+      if (!advPanelEl || advPanelEl.classList.contains('hidden')) return;
+      if (advPanelEl.contains(event.target)) return;
+      if (mobileAdvancedBtn && mobileAdvancedBtn.contains(event.target)) return;
+      advPanelEl.classList.add('hidden');
+    });
+
     state.ui = { searchSpinner };
   }
 
@@ -315,6 +363,7 @@
       updateRegions();
       renderSidebar();
       renderMarkers();
+      renderMobileCards();
       renderSearchOverlay();
       fitMapToVisibleProperties();
       showStatus('Properties loaded', 'success', 1800);
@@ -454,6 +503,7 @@
       renderMarkers();
       toggleEmptyState();
       renderSearchOverlay();
+      renderMobileCards();
       fitMapToVisibleProperties();
     } catch (error) {
       state.employeeMatches = [];
@@ -488,6 +538,53 @@
     state.visibleProperties.forEach((property) => {
       container.appendChild(createPropertyCard(property));
     });
+  }
+
+  function renderMobileCards() {
+    const overlay = document.getElementById(SELECTORS.mobileOverlay);
+    const stack = document.getElementById(SELECTORS.mobileCardStack);
+    if (!overlay || !stack) return;
+    if (!state.isMobile) {
+      overlay.classList.add('hidden');
+      stack.innerHTML = '';
+      return;
+    }
+    overlay.classList.remove('hidden');
+    stack.innerHTML = '';
+
+    const properties = state.visibleProperties.slice(0, 12);
+    properties.forEach((property) => {
+      const card = document.createElement('div');
+      card.className = 'mobile-mini-card';
+      const location = [property.city, property.state].filter(Boolean).join(', ');
+      const addressLine = [property.address, property.city, property.state, property.zip].filter(Boolean).join(', ');
+      const unitsText = property.units != null ? `${property.units} units` : 'Units n/a';
+      const vacancyText = property.hasVacancy ? 'Vacancy' : 'All positions filled';
+      const regionalManager = property.regionalManager && property.regionalManager.employeeName
+        ? property.regionalManager.employeeName
+        : 'Not assigned';
+      const regionalMaintenance = property.regionalMaintenanceSupervisor && property.regionalMaintenanceSupervisor.employeeName
+        ? property.regionalMaintenanceSupervisor.employeeName
+        : 'Not assigned';
+      card.innerHTML = `
+        <div class="tag">${property.hasVacancy ? 'Vacancy' : 'Staffed'}</div>
+        <h4>${property.property}</h4>
+        <p>${location || 'Location unavailable'}</p>
+        <p>${addressLine || 'Address n/a'}</p>
+        <p class="text-accent">${unitsText}</p>
+        <p>${vacancyText}</p>
+        <p><span class="label">RM:</span> ${regionalManager}</p>
+        <p><span class="label">Maint:</span> ${regionalMaintenance}</p>
+      `;
+      card.addEventListener('click', () => {
+        centerOnProperty(property.propertyId);
+      });
+      card.addEventListener('dblclick', () => {
+        openStaffDrawer(property.propertyId, property.property);
+      });
+      stack.appendChild(card);
+    });
+    stack.scrollLeft = 0;
   }
 
   function ensureEmptyState(scroller) {
@@ -1069,6 +1166,77 @@
       throw new Error(`Missing element #${id}`);
     }
     return element;
+  }
+
+  function wireMobileSearch() {
+    const mobileSearchBtn = document.getElementById(SELECTORS.mobileSearchBtn);
+    const sheet = document.getElementById('mobileSearchSheet');
+    const input = document.getElementById('mobileSearchInput');
+    const submit = document.getElementById('mobileSearchSubmit');
+    const closeBtn = document.getElementById('mobileSearchClose');
+    if (!mobileSearchBtn || !sheet || !input || !submit || !closeBtn) return;
+
+    const openSheet = () => {
+      sheet.classList.remove('hidden');
+      input.value = state.filters.query || '';
+      input.focus();
+    };
+    const closeSheet = () => {
+      sheet.classList.add('hidden');
+      input.blur();
+    };
+    const doSearch = () => {
+      const value = (input.value || '').trim();
+      state.filters.query = value;
+      state.showSearchOverlay = false;
+      hideSearchOverlay();
+      performSearch();
+      closeSheet();
+    };
+
+    mobileSearchBtn.addEventListener('click', () => {
+      if (state.isMobile) {
+        openSheet();
+      } else {
+        state.showSearchOverlay = true;
+        const searchInput = document.getElementById(SELECTORS.searchInput);
+        if (searchInput) {
+          searchInput.focus();
+          searchInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }
+    });
+    submit.addEventListener('click', doSearch);
+    closeBtn.addEventListener('click', closeSheet);
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        doSearch();
+      }
+      if (event.key === 'Escape') {
+        closeSheet();
+      }
+    });
+  }
+
+  function moveAdvancedPanelForMobile(isMobile) {
+    const advPanel = document.getElementById(SELECTORS.advancedFilters);
+    if (!advPanel) return;
+    if (isMobile) {
+      if (!advPanelOriginalParent) {
+        advPanelOriginalParent = advPanel.parentElement;
+      }
+      if (advPanel.parentElement !== document.body) {
+        document.body.appendChild(advPanel);
+      }
+      advPanel.classList.add('mobile-advanced-panel');
+      advPanel.classList.add('hidden');
+    } else {
+      advPanel.classList.remove('mobile-advanced-panel');
+      if (advPanelOriginalParent && advPanel.parentElement !== advPanelOriginalParent) {
+        advPanelOriginalParent.appendChild(advPanel);
+      }
+      advPanel.classList.add('hidden');
+    }
   }
 
   function slugify(value) {
